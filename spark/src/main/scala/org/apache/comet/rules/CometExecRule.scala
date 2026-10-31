@@ -62,13 +62,28 @@ import org.apache.spark.sql.types._
 import org.apache.comet.{CometConf, CometExplainInfo, ConfigEntry, ExtendedExplainInfo}
 import org.apache.comet.CometConf.{COMET_SPARK_TO_ARROW_ENABLED, COMET_SPARK_TO_ARROW_SUPPORTED_OPERATOR_LIST}
 import org.apache.comet.CometSparkSessionExtensions._
-import org.apache.comet.rules.CometExecRule.allExecs
+import org.apache.comet.rules.CometExecRule.{allExecs, copyLogicalLinks}
 import org.apache.comet.serde._
 import org.apache.comet.serde.OperatorOuterClass.Operator
 import org.apache.comet.serde.operator._
 import org.apache.comet.shims.{CometTypeShim, ShimCometMergeRows, ShimCometStreaming, ShimCometWindowGroupLimit, ShimSubqueryBroadcast}
 
 object CometExecRule {
+
+  // setLogicalLink promotes an inherited link to a direct link and also rewrites descendants.
+  private[rules] def copyLogicalLinks(
+      from: SparkPlan,
+      to: SparkPlan,
+      clearMissing: Boolean): Unit = {
+    if (from ne to) {
+      def copyTag(tag: TreeNodeTag[LogicalPlan]): Unit = from.getTagValue(tag) match {
+        case Some(plan) => to.setTagValue(tag, plan)
+        case None => if (clearMissing) to.unsetTagValue(tag)
+      }
+      copyTag(SparkPlan.LOGICAL_PLAN_TAG)
+      copyTag(SparkPlan.LOGICAL_PLAN_INHERITED_TAG)
+    }
+  }
 
   /**
    * Whether `scan` reads a relation stored in Comet's cache format. Comet's serializer stores
@@ -768,9 +783,7 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
         } yield {
           // AQE can link the current projection to a materialized logical query stage.
           // Its originalPlan may have an older link; preserve the current direct/inherited tags.
-          Seq(SparkPlan.LOGICAL_PLAN_TAG, SparkPlan.LOGICAL_PLAN_INHERITED_TAG).foreach { tag =>
-            project.getTagValue(tag).foreach(rebuilt.setTagValue(tag, _))
-          }
+          copyLogicalLinks(project, rebuilt, clearMissing = false)
           rebuilt
         }
       }
@@ -1119,24 +1132,23 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
       // Set up logical links
       newPlan = newPlan.transform {
         case op: CometExec =>
-          // Spark links a reused physical root directly to the current AQE stage. A descendant
-          // can inherit that stage if it wraps the descendant's original logical node.
+          // Spark reuses the physical root and links it directly to the current AQE stage.
+          // A descendant can inherit that stage if it wraps the descendant's original node.
+          // AQE replaces the linked node by identity. A stale link leaves the plan unchanged.
+          // scalastyle:off line.size.limit
+          // https://github.com/apache/spark/blob/v4.1.3/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala#L64-L65
+          // https://github.com/apache/spark/blob/v4.1.3/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala#L78-L87
+          // https://github.com/apache/spark/blob/v4.1.3/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala#L778-L783
+          // scalastyle:on line.size.limit
           val keepStage = op.logicalLink.exists {
             case stage: LogicalQueryStage =>
+              // logicalLink prefers the direct tag, so if present it points to this stage.
               op.getTagValue(SparkPlan.LOGICAL_PLAN_TAG).isDefined ||
               op.originalPlan.logicalLink.exists(stageWraps(stage, _))
             case _ => false
           }
           if (!keepStage) {
-            // setLogicalLink promotes an inherited link to a direct boundary and propagates
-            // it into children, overwriting their current stage links. Restore each tag locally.
-            def restore(tag: TreeNodeTag[LogicalPlan]): Unit =
-              op.originalPlan.getTagValue(tag) match {
-                case Some(plan) => op.setTagValue(tag, plan)
-                case None => op.unsetTagValue(tag)
-              }
-            restore(SparkPlan.LOGICAL_PLAN_TAG)
-            restore(SparkPlan.LOGICAL_PLAN_INHERITED_TAG)
+            copyLogicalLinks(op.originalPlan, op, clearMissing = true)
           }
           op
         case op: CometShuffleExchangeExec =>
