@@ -190,7 +190,7 @@ object CometAdd extends CometExpressionSerde[Add] with MathBase {
       // proto stays shallow and doesn't overflow protobuf's recursion limit when re-parsed.
       val operands = flattenAssociative(
         expr,
-        { case _: Add => true; case _ => false },
+        { case a: Add => a.evalMode == expr.evalMode; case _ => false },
         { case a: Add => (a.left, a.right) })
       createBalancedMathExpr(
         operands,
@@ -246,7 +246,7 @@ object CometMultiply extends CometExpressionSerde[Multiply] with MathBase {
       // proto stays shallow and doesn't overflow protobuf's recursion limit when re-parsed.
       val operands = flattenAssociative(
         expr,
-        { case _: Multiply => true; case _ => false },
+        { case m: Multiply => m.evalMode == expr.evalMode; case _ => false },
         { case m: Multiply => (m.left, m.right) })
       createBalancedMathExpr(
         operands,
